@@ -7,7 +7,7 @@ from . import config
 async def chat(system: str, user: str, timeout: float) -> str:
     if not config.AIPIPE_TOKEN:
         raise RuntimeError("AIPIPE_TOKEN is not set")
-    body = {"model": config.LLM_MODEL, "temperature": 0, "max_tokens": 3500,
+    body = {"model": config.LLM_MODEL, "temperature": 0, "max_tokens": config.MAX_OUTPUT_TOKENS,
             "response_format": {"type": "json_object"},
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
     async with httpx.AsyncClient(timeout=timeout) as c:
