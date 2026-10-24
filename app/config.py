@@ -28,3 +28,4 @@ REQUEST_BUDGET_S = 40          # grader allows 45s per request
 MAX_RESPONSE_BYTES = 480 * 1024  # spec limit is 512 KiB
 
 CHUNK_SIZE = int(_env("CHUNK_SIZE", "6"))  # packages per model call; chunks run in parallel
+MAX_OUTPUT_TOKENS = int(_env("MAX_OUTPUT_TOKENS", "1800"))  # per model call; lower if provider balance is small
