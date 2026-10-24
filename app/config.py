@@ -26,3 +26,5 @@ DB_PATH = _env("DB_PATH", "agent.db")
 
 REQUEST_BUDGET_S = 40          # grader allows 45s per request
 MAX_RESPONSE_BYTES = 480 * 1024  # spec limit is 512 KiB
+
+CHUNK_SIZE = int(_env("CHUNK_SIZE", "6"))  # packages per model call; chunks run in parallel
