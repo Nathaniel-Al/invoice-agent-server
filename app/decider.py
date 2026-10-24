@@ -1,25 +1,37 @@
-"""Decision layer: one batched model call per request, cached by canonical package content."""
+"""Decision layer: parallel chunked model calls, cached by canonical package content."""
+import asyncio
 import json
 import logging
 import time
 
-from . import llm, store
-from .protocol import ACTIONS, sha, canon
+from . import config, llm, store
+from .protocol import ACTIONS, canon, sha
 
 log = logging.getLogger("decider")
 
-SYSTEM = """You are an invoice-operations analyst. For EACH invoice package choose exactly one action:
-- settle_invoice: valid, reconciled, within autonomous payment authority.
-- request_approval: commercially valid but the amount/terms exceed delegated authority.
-- hold_invoice: payment pauses until a stated verification completes (e.g. bank-detail change, missing receipt/PO check).
-- reject_duplicate: the SAME commercial invoice (same vendor, invoice number, amount) was already paid. A payment for a DIFFERENT invoice is NOT a duplicate.
-- open_exception: material records conflict (amount/PO/receipt/vendor mismatch) and need an exception workflow.
-Documents mix real facts with archived/old examples, training decoys, negated statements, a cover sheet and irrelevant action words. Find the ONE paragraph of the CURRENT package that actually determines the action under the given policy revision; ignore everything else. Words like "approve" or "duplicate" inside archives, examples or negations do not count.
-evidenceRefs: exactly the three decisive bracketed references (copy verbatim, including brackets) from that determining paragraph. Never include the cover-sheet reference, archive examples or decoys.
-facts: vendorName, invoiceNumber (strings), amountMinor (integer minor units, e.g. 12345.67 INR -> 1234567), currency (ISO code) of the invoice being decided.
-rationale: 60-1500 characters; name the chosen action and quote at least two of the evidence refs.
-Reply with ONLY a JSON object:
-{"decisions":[{"packageId":"...","action":"...","facts":{"vendorName":"...","invoiceNumber":"...","amountMinor":0,"currency":"INR"},"evidenceRefs":["","",""],"rationale":"..."}]}"""
+SYSTEM = """You are a careful accounts-payable analyst. For EACH invoice package pick exactly one action.
+
+ACTIONS
+- settle_invoice: the invoice is valid, fully reconciled (invoice vs PO vs receipt/records agree), no verification pending, and the amount is within autonomous authority.
+- request_approval: commercially valid and reconciled, but the amount/terms exceed the delegated approval limit stated for this package, so a higher approver must sign off.
+- hold_invoice: payment must pause until a specifically stated verification completes (e.g. bank-detail change callback, tax/compliance document, vendor onboarding check).
+- reject_duplicate: this SAME commercial invoice was already paid (same vendor AND same invoice number AND same amount). A payment for a DIFFERENT invoice number or different amount is NOT a duplicate, even for the same vendor.
+- open_exception: material records conflict (amount, quantity, PO, receipt, vendor or currency mismatch) and need an exception workflow rather than payment.
+
+HOW TO READ A PACKAGE
+1. The package contains many paragraphs: a cover sheet, archive/old examples, training decoys, boilerplate and negated statements ("this is NOT a duplicate", "no approval was required in the past example"). Words like settle/approve/duplicate/hold in those do NOT decide anything.
+2. Exactly one paragraph about the CURRENT invoice contains the controlling facts and carries three bracketed reference IDs. That paragraph decides the action. Read it literally: compare the numbers it gives (amount vs limit, invoice vs PO/receipt, prior payment vs this invoice) yourself.
+3. Apply the policy revision supplied with the batch.
+4. Do not default to one action. Different packages in a batch usually need different actions.
+
+OUTPUT FIELDS
+- action: one of the five above.
+- facts: vendorName, invoiceNumber (strings), amountMinor (integer minor units: 12345.67 INR -> 1234567; zero-decimal currencies unchanged), currency (ISO code) for the CURRENT invoice.
+- evidenceRefs: exactly the three bracketed references of the controlling paragraph, copied verbatim (include the brackets/format used). Never the cover-sheet reference, archive examples or decoys.
+- why: ONE sentence, max 220 characters, stating the controlling fact that leads to the action (e.g. the amount vs limit, the matching prior payment, the mismatch, the pending verification).
+
+Reply with ONLY this JSON object, no commentary:
+{"decisions":[{"packageId":"...","action":"...","facts":{"vendorName":"...","invoiceNumber":"...","amountMinor":0,"currency":"INR"},"evidenceRefs":["","",""],"why":"..."}]}"""
 
 
 def pkg_id(p):
@@ -27,7 +39,7 @@ def pkg_id(p):
 
 
 def pkg_key(p):
-    # identifiers are stripped so reused content under new batch/package namespaces hits the cache
+    # identifiers stripped so reused content under new batch/package namespaces hits the cache
     return sha(canon({k: v for k, v in p.items() if k not in ("packageId", "id", "batchId")}))
 
 
@@ -45,9 +57,10 @@ def _clean(pkg, d, strict=True):
                 refs.append(r)
         if (strict and len(refs) != 3) or not refs:
             return None
-        rat = str(d.get("rationale", "")).strip()
-        if d["action"] not in rat or sum(r in rat for r in refs[:2]) < 2 or len(rat) < 60:
-            rat = f"{rat} Action {d['action']}; decisive evidence {', '.join(refs)}.".strip()
+        why = " ".join(str(d.get("why") or d.get("rationale") or "").split())[:260]
+        rat = f"Action {d['action']}: {why} Decisive evidence: {', '.join(refs)}."
+        if len(rat) < 60:
+            rat += " The cited references in the controlling paragraph support this action for the current invoice."
         return {"action": d["action"], "facts": facts, "evidenceRefs": refs, "rationale": rat[:1500]}
     except Exception:
         return None
@@ -59,30 +72,47 @@ def _parse(txt):
     return {str(x.get("packageId")): x for x in arr if isinstance(x, dict)}
 
 
+async def _run(policy, items, deadline, strict):
+    left = deadline - time.monotonic()
+    if not items or left < 6:
+        return {}
+    payload = {"policyRevision": policy,
+               "packages": [{"packageId": pid, "content": pkg} for pid, pkg in items.values()]}
+    t0 = time.monotonic()
+    try:
+        txt = await llm.chat(SYSTEM, json.dumps(payload, ensure_ascii=False), left - 2)
+        byid = _parse(txt)
+    except Exception as e:
+        log.warning("model call failed (%d pkgs, %.1fs): %s %s", len(items), time.monotonic() - t0,
+                    type(e).__name__, str(e)[:300])
+        return {}
+    done = {}
+    for k, (pid, pkg) in items.items():
+        d = _clean(pkg, byid.get(str(pid), {}), strict)
+        if d:
+            done[k] = d
+    log.info("model ok: %d/%d valid in %.1fs", len(done), len(items), time.monotonic() - t0)
+    return done
+
+
 async def _ask(policy, items, deadline):
-    done, pending = {}, dict(items)
-    for attempt in range(2):
-        left = deadline - time.monotonic()
-        if not pending or left < 8:
-            break
-        payload = {"policyRevision": policy,
-                   "packages": [{"packageId": pid, "content": pkg} for pid, pkg in pending.values()]}
-        try:
-            byid = _parse(await llm.chat(SYSTEM, json.dumps(payload, ensure_ascii=False), left - 2))
-        except Exception as e:  # network/parse error: retry once if time allows
-            log.warning("model call failed: %s", type(e).__name__)
-            continue
-        for k, (pid, pkg) in list(pending.items()):
-            d = _clean(pkg, byid.get(str(pid), {}), strict=(attempt == 0))
-            if d:
-                done[k] = d
-                del pending[k]
-    for k in pending:  # safe fallback: never pays, never cached
-        done[k] = {"action": "hold_invoice",
-                   "facts": {"vendorName": "unknown", "invoiceNumber": "unknown", "amountMinor": 0, "currency": "INR"},
-                   "evidenceRefs": [],
-                   "rationale": "Decision could not be verified automatically; hold_invoice pauses payment until a "
-                                "reviewer confirms the package evidence. No payment is released in the meantime."}
+    keys, size = list(items), max(1, config.CHUNK_SIZE)
+    chunks = [{k: items[k] for k in keys[i:i + size]} for i in range(0, len(keys), size)]
+    done = {}
+    for r in await asyncio.gather(*[_run(policy, c, deadline, True) for c in chunks]):
+        done.update(r)
+    pending = {k: v for k, v in items.items() if k not in done}
+    if pending:  # one lenient retry for whatever failed validation
+        done.update(await _run(policy, pending, deadline, False))
+    for k in items:
+        if k not in done:
+            log.error("FALLBACK hold_invoice used for a package")
+            done[k] = {"action": "hold_invoice",
+                       "facts": {"vendorName": "unknown", "invoiceNumber": "unknown",
+                                 "amountMinor": 0, "currency": "INR"},
+                       "evidenceRefs": [],
+                       "rationale": "Action hold_invoice: the decision could not be verified automatically, so payment "
+                                    "is paused until a reviewer confirms the package evidence."}
     return done
 
 
@@ -99,6 +129,8 @@ async def decide(batch, deadline):
     if missing:
         for k, d in (await _ask(batch.get("policyRevision"), missing, deadline)).items():
             res[k] = d
-            if d["evidenceRefs"]:
+            if d["evidenceRefs"]:  # fallbacks are never cached
                 store.cache_put(k, d)
-    return [res[pkg_key(p)] for p in batch["packages"]]
+    out = [res[pkg_key(p)] for p in batch["packages"]]
+    log.info("batch actions: %s", {a: sum(o["action"] == a for o in out) for a in ACTIONS})
+    return out
