@@ -67,9 +67,44 @@ def _clean(pkg, d, strict=True):
 
 
 def _parse(txt):
-    obj = json.loads(txt[txt.index("{"): txt.rindex("}") + 1])
-    arr = obj.get("decisions") if isinstance(obj, dict) else obj
+    """Tolerant JSON extraction: code fences, trailing text, or a truncated decisions array."""
+    dec = json.JSONDecoder()
+    i = txt.find("{")
+    if i < 0:
+        raise ValueError("no JSON object")
+    arr = None
+    try:
+        obj, _ = dec.raw_decode(txt[i:])
+        arr = obj.get("decisions") if isinstance(obj, dict) else obj
+        if arr is None and isinstance(obj, dict) and "action" in obj:
+            arr = [obj]
+    except ValueError:
+        pass
+    if not isinstance(arr, list):  # salvage complete objects from a damaged array
+        arr, pos = [], txt.find("[", txt.find("decisions")) + 1
+        while pos > 0:
+            k = txt.find("{", pos)
+            if k < 0:
+                break
+            try:
+                o, end = dec.raw_decode(txt[k:])
+            except ValueError:
+                break
+            arr.append(o)
+            pos = k + end
+        if not arr:
+            raise ValueError("no decisions parsed")
     return {str(x.get("packageId")): x for x in arr if isinstance(x, dict)}
+
+
+_sem = None
+
+
+def _semaphore():
+    global _sem
+    if _sem is None:
+        _sem = asyncio.Semaphore(max(1, config.MAX_CONCURRENCY))
+    return _sem
 
 
 async def _run(policy, items, deadline, strict):
@@ -80,7 +115,8 @@ async def _run(policy, items, deadline, strict):
                "packages": [{"packageId": pid, "content": pkg} for pid, pkg in items.values()]}
     t0 = time.monotonic()
     try:
-        txt = await llm.chat(SYSTEM, json.dumps(payload, ensure_ascii=False), left - 2)
+        async with _semaphore():
+            txt = await llm.chat(SYSTEM, json.dumps(payload, ensure_ascii=False), max(8.0, deadline - time.monotonic() - 2))
         byid = _parse(txt)
     except Exception as e:
         log.warning("model call failed (%d pkgs, %.1fs): %s %s", len(items), time.monotonic() - t0,
